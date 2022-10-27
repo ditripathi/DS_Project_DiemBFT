@@ -1,0 +1,26 @@
+from block import QC
+from messages import TimeoutMsg
+import logging
+
+class Pacemaker:
+    def __init__(self):
+        self.current_round = 0
+        self.last_round_tc = None
+        self.pending_timeouts = 0
+        self.logger=logging.getLogger('DIEM')
+
+    def process_remote_timeout(self, tmo:TimeoutMsg):
+        return None
+
+    def advance_round_qc(self, qc: 'QC'):
+        # print("QC", qc)
+        #logger.info("QC", qc)
+        if qc.vote_info.round < self.current_round:
+            return False
+        self.last_round_tc = None
+        self.current_round = qc.vote_info.round + 1
+        return True
+
+    def advance_round_tc(self, qc: QC):
+        # TODO: Implement the advance round TC
+        return None

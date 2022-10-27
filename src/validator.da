@@ -1,0 +1,176 @@
+# from src.crypto import sign
+from src.ledger import Ledger
+from src.safety import Safety
+from src.mempool import MemPool
+from src.info import ValidatorInfo
+from src.pacemaker import Pacemaker
+from src.messages import TC, ProposalMsg
+from src.leader_election import LeaderElection
+from src.block import QC, Block, LedgerCommitInfo, VoteInfo, VoteMsg, BlockTree
+import logging
+
+def get_logger(file_name):
+    logger = logging.getLogger('DIEM')
+    logger.setLevel(logging.INFO)
+    fh = logging.FileHandler(file_name, mode='w+')
+    fh.setLevel(logging.INFO)
+    formatter = logging.Formatter('-->%(asctime)s -%(process)d - %(name)s:%(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    return logger
+
+class Validator(process):
+    def setup(author, priv_key, validator_pub, client_pub, validators, clients,
+    rtt):
+        #self.broadcast = servers
+        self.validator_info = ValidatorInfo(
+            author=author,
+            validator_pks=validator_pub,
+            private_key=priv_key,
+            client_pks=client_pub,
+            f=(len(validator_pub) - 1)//3
+        )
+        n_validators = len(self.validator_info.validator_pks)
+        self.ledger = Ledger(ledger_file_name=f'ledgers/ledger-{self.validator_info.author}.log',
+        n_validators=n_validators)
+        self.logger = get_logger(f'logs/Validator-{self.validator_info.author}.log')
+        self.mempool = MemPool()
+        self.block_tree = BlockTree(ledger, validator_info)
+        self.safety = Safety(ledger, block_tree, validator_info)
+        self.leader_election = LeaderElection(len(validator_pub))
+        self.pacemaker = Pacemaker()
+        self.validators = validators
+        self.rtt = rtt
+
+    def send_to_client(state):
+        logger.debug(f'Enter func Send to client')
+        if not state:
+            logger.info("State is None; Nothing to send")
+        try:
+            proposal_no, c_id, message = state.state_value.split('--')
+            proposal_no = int(proposal_no)
+            c_id = int(c_id)
+            logger.info(f'Sending to client{c_id}')
+            mempool.commit_to_cache(proposal_no, c_id, state)
+            send(('Committed', proposal_no, message), to=list(clients)[c_id])
+            logger.info(f'Giving reply after commit to client {c_id}')
+        except:
+            output("Can't parse output")
+
+    def process_certificate_qc(qc):
+        # output("before processing QC", qc)
+        committed_state = block_tree.process_qc(qc)
+        send_to_client(committed_state)
+        logger.debug(f"process_qc done {qc}")
+        leader_election.update_leaders(qc)
+        logger.debug("Update leaders done")
+        pacemaker.advance_round_qc(qc)
+        logger.info(f"Advance round qc done {pacemaker.current_round}")
+    
+    def process_proposal_msg(proposal_msg):
+        logger.debug(f"Process proposal message started")
+        process_certificate_qc(proposal_msg.block.qc)
+        logger.debug(f"Processed certificate qc for {proposal_msg.block.qc}")
+        process_certificate_qc(proposal_msg.high_commit_qc)
+        pacemaker.advance_round_tc(proposal_msg.last_round_tc)
+        curr_round = pacemaker.current_round
+        leader = leader_election.get_leader(curr_round)
+        if proposal_msg.block.round != curr_round or proposal_msg.sender != \
+            leader or proposal_msg.block.author != leader:
+            return
+        block_tree.execute_and_insert(proposal_msg.block)
+        logger.info(f"Inserted block in block tree")
+        vote_msg = safety.make_vote(proposal_msg.block, proposal_msg.last_round_tc)
+        if vote_msg is not None:
+            logger.info("Insert block in block tree")
+            next_round_leader = leader_election.get_leader(curr_round+1)
+            send(VoteMsg.to_tuple(vote_msg), to=list(validators)[next_round_leader])
+            logger.info(f"send vote message tuple")
+
+    def process_timeout_msg(timeout_msg):
+        logger.info("Process Timeout message")
+        process_certificate_qc(timeout_msg.tmo_info.high_qc)
+        process_certificate_qc(timeout_msg.high_commit_qc)
+        pacemaker.advance_round_tc(timeout_msg.last_round_tc)
+        tc = pacemaker.process_remote_timeout(timeout_msg)
+        if tc != None:
+            pacemaker.advance_round_tc(tc)
+            process_new_round_event(tc)
+    
+    def process_vote_msg(vote_msg):
+        output("Processing vote msg")
+        qc = block_tree.process_vote(vote_msg)
+        logger.info(f"Process vote message - {vote_msg}")
+        if qc is not None:
+            process_certificate_qc(qc)
+            process_new_round_event(None)
+
+    def process_new_round_event(last_tc):
+        logger.info(f"Process new round event for last tc")
+        leader = leader_election.get_leader(pacemaker.current_round)
+        logger.info(f"Leader of this round is: {leader}")
+        # print(self.mempool.dq)
+        if leader == author:
+            logger.info("Fetching transactions")
+            txns = self.mempool.get_transactions()
+            # if txns == 'DUMMY':
+            #     contiguous_dummies += 1
+            # else:
+            #     contiguous_dummies = 0
+            # if contiguous_dummies > 2:
+            #     await(some(received(('Propose', _, _, _))))
+            logger.info("Making block")
+            block = block_tree.generate_block(txns, 
+            pacemaker.current_round)
+            logger.info("Making ProposalMsg")
+            proposal_msg = ProposalMsg(block, last_tc, block_tree.high_commit_qc, 
+            '', author)
+            send(ProposalMsg.to_tuple(proposal_msg), to=validators)
+            logger.info(f"Sending Proposal message to validator")
+
+    def run():
+        if author == 0:
+            logger.info(f"await for some rreceived proposal")
+            if await(some(received(('Propose', _, _, _)))):
+                process_new_round_event(None)
+        if await(len(setof(c, received(('Done'), from_=c))) >= len(client_pub)):
+            logger.info(f"Reset the received messages")
+            reset(received)
+    
+    def receive(msg=('LocalTimeout')):
+        raise NotImplementedError
+        # pacemaker.local_timeout_round()
+
+    def receive(msg=('ProposalMsg', block, tc, high_commit_qc, signature, sender)):
+        logger.info(f"Proposal message is received")
+        block = Block.from_tuple(*block)
+        # output("Block DONE")
+        tc = None if not tc else TC(*tc)
+        # output("tc DONE")
+        # output("HIGH COMMIT QC", high_commit_qc)
+        high_commit_qc = QC.from_tuple(*high_commit_qc)
+        proposal_msg = ProposalMsg(block, tc, high_commit_qc, signature, sender)
+        logger.info("Formatted / validated. Processing ProposalMsg")
+        process_proposal_msg(proposal_msg)
+
+    def receive(msg=('VoteMsg', vi, lci, hc_qc, sender, signature)):
+        vote_info = VoteInfo(*vi)
+        ledger_commit_info = LedgerCommitInfo(*lci)
+        qc = QC.from_tuple(*hc_qc)
+        vote_msg = VoteMsg(vote_info, ledger_commit_info, qc, sender, signature)
+        process_vote_msg(vote_msg)
+
+    def receive(msg=('TimeoutMsg')):
+        logger.info(f"Received proposal message from client ")
+        # process_timeout_message(msg)
+        raise NotImplementedError
+
+    def receive(msg=('Propose', round_no, id, message_content), from_=client):
+        cached_state = mempool.try_to_add_to_mempool(('Propose', round_no, id, message_content))
+        if cached_state:
+            logger.info(f"sending cached state to client")
+            send_to_client(cached_state)
+        logger.info(f"handling message in receive queue")
+        logger.info(f"Received message for round {round_no} from client {id} message content is {message_content}")
+        # self.mempool.commit_to_cache(round_no, id, 'Comitted ' + str(round_no) + ' - ' + str(id))
+        # send(('Comitted', round_no, 'Comitted ' + str(round_no) + ' - ' + str(id)), to=c)

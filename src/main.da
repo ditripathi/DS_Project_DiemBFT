@@ -1,0 +1,89 @@
+import os
+import sys
+import glob
+import json
+
+from nacl.signing import SigningKey
+from nacl.encoding import Base64Encoder
+
+from client import Client
+from validator import Validator
+
+
+class RunDiem(process):
+    def setup(config, n_case, parent):
+        self.n_clients = config['n_clients']
+        self.n_client_reqs = config['n_client_reqs']
+        self.client_tmo = config['client_tmo']
+        self.n_validators = config['n_validators']
+        self.validator_rtt = config['validator_rtt']
+
+    def client_name(i):
+        return f'client-{i}'
+
+    def validator_name(i):
+        return f'validator-{i}'
+
+    def run():
+        # create clients and validators
+        validators = new(Validator, num=n_validators)
+        clients = new(Client, num=n_clients)
+        # key pairs for distribution
+        validator_priv = []
+        validator_pub = []
+        client_priv = []
+        client_pub = []
+        # create keys
+        for i in range(n_clients):
+            # name = self.client_name(i)
+            client_priv.append(SigningKey.generate())
+            client_pub.append(client_priv[i].verify_key.encode(
+                encoder=Base64Encoder))
+        for i in range(n_validators):
+            # name = self.validator_name(i)
+            validator_priv.append(SigningKey.generate())
+            validator_pub.append(validator_priv[i].verify_key.encode(
+                encoder=Base64Encoder))
+        # setup
+        for v_id, validator in enumerate(validators):
+            # name = validator_name(i)
+            setup(validator, (v_id, validator_priv[v_id], validator_pub, 
+            client_pub, validators, clients, validator_rtt))
+        for c_id, client in enumerate(clients):
+            # name = self.client_name(i)
+            setup(client, (c_id, client_priv[c_id], validator_pub, validators, 
+            n_client_reqs, client_tmo))
+
+        start(validators)
+        start(clients)
+        
+        await(each(c in clients, has=received(('Done',), from_=clients)))
+        output("Done with all requests on all clients....Exiting") 
+        return None
+
+
+def main():
+    config_dict = None
+    if len(sys.argv) > 1:
+        # print(sys.argv[1])
+        if os.path.exists(sys.argv[1]):
+            config_filename = sys.argv[1]
+            with open(config_filename, 'r+') as f:
+                config_dict = json.load(f)
+        else:
+            print("Specified file doesn't exist")
+            exit(1)
+    config(channel='fifo', clock='Lamport')
+    # list of configurations
+    configs = [{'n_clients': 3, 'n_client_reqs': 5, 'client_tmo': 10, 
+    'n_validators': 3, 'validator_rtt': 5}] if not config_dict else config_dict
+    # delete old ledgers and logs
+    for log in glob.glob('logs/*.log'):
+        os.remove(log)
+    for log in glob.glob('ledgers/*.log'):
+        os.remove(log)
+    # running test cases with listed configs
+    for i, config in enumerate(configs):
+        test_case = new(RunDiem)
+        setup(test_case, (config, i, test_case))
+        start(test_case)

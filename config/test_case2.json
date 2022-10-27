@@ -1,0 +1,9 @@
+[
+    {
+        "n_clients": 2,
+        "n_client_reqs": 3, 
+        "client_tmo": 8, 
+        "n_validators": 2, 
+        "validator_rtt": 6
+    }
+]

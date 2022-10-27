@@ -1,0 +1,103 @@
+from typing import List
+from block import QC, Block, BlockTree, LedgerCommitInfo, VoteInfo, VoteMsg
+from crypto import hasher, sign, valid_signatures
+from info import ValidatorInfo
+from messages import TC, TimeoutInfo
+from ledger import Ledger
+import logging
+
+def get_logger(file_name):
+    logger = logging.getLogger('DIEM')
+    logger.setLevel(logging.INFO)
+    fh = logging.FileHandler(file_nam, mode='w+')
+    fh.setLevel(logging.INFO)
+    formatter = logging.Formatter('-->%(asctime)s -%(process)d - %(name)s:%(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    return logger
+
+class Safety:
+    _private_key: str
+    _public_keys: List[str]
+    _highest_vote_round: int
+    _highest_qc_round: int
+    # common requirements
+    _ledger: Ledger
+    _block_tree: BlockTree
+    _validator_info: ValidatorInfo
+
+
+    def __init__(self, ledger: Ledger, block_tree: BlockTree, 
+    validator_info: ValidatorInfo) -> None:
+        self._validator_info = validator_info
+        self._private_key = validator_info.private_key
+        self._public_keys = validator_info.validator_pks
+        self._ledger = ledger
+        self._block_tree = block_tree
+        self._highest_vote_round = -1
+        self._highest_qc_round = -1
+        logger=logging.getLogger('DIEM')
+
+    
+    def _increase_highest_vote_round(self, round: int):
+        self._highest_vote_round = max(round, self._highest_vote_round)
+
+    def _update_highest_qc_round(self, qc_round: int):
+        self._highest_qc_round = max(qc_round, self._highest_qc_round)
+
+    def _consecutive(self, block_round: int, round: int):
+        # TODO: CHECK
+        return round + 1 == block_round
+
+    def _safe_to_extend(self, block_round: int, qc_round: int, tc: TC):
+        return self._consecutive(block_round, tc.round) and \
+            (qc_round >= max(tc.tmo_high_qc_rounds)) 
+
+    def _safe_to_vote(self, block_round: int, qc_round: int, tc: TC):
+        if block_round <= max(self._highest_vote_round, qc_round):
+            return False
+        return self._consecutive(block_round, qc_round) or \
+            self._safe_to_extend(block_round, qc_round, tc)
+
+    def _safe_to_timeout(self, round: int, qc_round: int, tc: TC):
+        if (qc_round < self._highest_qc_round) or \
+            (round <= max(self._highest_vote_round - 1, qc_round)):
+            return False
+        return self._consecutive(round, qc_round) or self._consecutive(round, tc.round)
+
+    def _commit_state_id_candidate(self, block_round: int, qc: QC):
+        if self._consecutive(block_round, qc.vote_info.round):
+            return self._ledger.pending_state(qc.vote_info.block_id)
+        return None
+
+    def make_vote(self, block: Block, last_tc: TC):
+        #logger.info(f"Make Vote - {last_tc}")
+        qc_round = block.qc.vote_info.round
+        if valid_signatures(block, last_tc) and self._safe_to_vote(block.round, 
+        qc_round, last_tc):
+            self._update_highest_qc_round(qc_round)
+            self._increase_highest_vote_round(block.round)
+            vote_info = VoteInfo(block_id=block.block_id, round=block.round, 
+            parent_block_id=block.qc.vote_info.block_id, 
+            parent_round=block.qc.vote_info.round, 
+            exec_state_id=self._ledger.pending_state(block_id=block.block_id))
+            ledger_commit_info = LedgerCommitInfo(
+                commit_state_id=self._commit_state_id_candidate(block.round, 
+                block.qc).state_id,
+                vote_info_hash=hasher(vote_info))
+            signature = sign(self._private_key, ledger_commit_info)
+            return VoteMsg(vote_info, ledger_commit_info, 
+                self._block_tree.high_commit_qc, 
+                sender=self._validator_info.author,
+                signature=signature)
+        return None
+
+    def make_timeout(self, round: int, high_qc: QC, last_tc: TC):
+        logger.info(f"Make Timeout - {high_qc}")
+        qc_round = high_qc.vote_info.round
+        if valid_signatures(high_qc, last_tc) and \
+            self._safe_to_timeout(round, qc_round, last_tc):
+            self._increase_highest_vote_round(round)
+            sender = self._validator_info.author
+            signature = sign(self._private_key, round + high_qc.vote_info.round)
+            return TimeoutInfo(round, high_qc, sender, signature)
